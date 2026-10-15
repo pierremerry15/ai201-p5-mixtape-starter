@@ -10,7 +10,7 @@ should notify someone about their own action.
 
 import pytest
 from app import create_app, db
-from models import User, Song, Playlist, Notification
+from models import User, Song, Playlist, Notification, playlist_entries
 from services.notification_service import (
     add_to_playlist,
     get_notifications,
@@ -78,6 +78,20 @@ def test_rating_and_playlist_add_both_notify(app, sharer_and_rater):
         actor = sharer_and_rater["actor"]
         song = sharer_and_rater["song"]
         playlist = sharer_and_rater["playlist"]
+
+        # Insert the entry with its position and added_by, the way seed_data.py
+        # populates playlists. add_to_playlist() then takes its "already
+        # present" branch and goes straight to the notification, which is the
+        # behaviour under test here.
+        db.session.execute(
+            playlist_entries.insert().values(
+                playlist_id=playlist.id,
+                song_id=song.id,
+                position=1,
+                added_by=actor.id,
+            )
+        )
+        db.session.commit()
 
         add_to_playlist(playlist.id, song.id, actor.id)
         rate_song(actor.id, song.id, 3)

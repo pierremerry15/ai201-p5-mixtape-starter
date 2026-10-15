@@ -257,9 +257,45 @@ Three of the five issues already had failing tests in the repo — `test_streak_
 
 **`tests/test_notifications.py`** — covers Issue #4. `test_rating_a_song_notifies_the_sharer` is the direct regression test: it fails against the original `rate_song()`, which created no notification. `test_rating_and_playlist_add_both_notify` asserts the two parallel actions produce both notification types for the same sharer, which is the consistency the issue was really about. The remaining cases pin the guards I reasoned about in the side-effect check — that rating your own song notifies nobody, that a rejected out-of-range score leaves no notification behind, and that a one-star rating is not rendered "1 stars."
 
-Run the full suite with:
+### Verification
+
+I checked both directions by restoring the original `services/` directory over the test suite and running it, then restoring the fixes.
+
+Against the original services, 8 of 22 tests fail — and every one of the five issues is represented:
+
+```
+FAILED tests/test_streaks.py::test_streak_increments_on_sunday - assert 1 == 2
+FAILED tests/test_search.py::test_search_no_duplicates_multi_tag_song
+FAILED tests/test_playlists.py::test_playlist_returns_all_songs
+FAILED tests/test_playlists.py::test_playlist_returns_songs_in_order
+FAILED tests/test_notifications.py::test_rating_a_song_notifies_the_sharer
+FAILED tests/test_notifications.py::test_rating_and_playlist_add_both_notify
+FAILED tests/test_notifications.py::test_single_star_rating_is_not_pluralised
+FAILED tests/test_feed.py::test_listen_from_late_yesterday_is_excluded
+8 failed, 14 passed
+```
+
+`test_streak_increments_on_sunday` failing with `assert 1 == 2` is kenji's report in miniature: the streak was reset to 1 instead of advancing to 2. `test_playlist_returns_songs_in_order` is worth noting as a second, independent signal for Issue #5 — the `[:-1]` slice fails it not because the ordering is wrong but because `Track 5` is missing from the end of the sequence.
+
+With the fixes in place, the whole suite passes:
+
+```
+22 passed
+```
+
+Run it yourself with:
 
 ```bash
 pytest tests/
 ```
+
+### One finding outside the five issues
+
+While writing the notification tests I hit a defect that is not on the issue list and that I deliberately did **not** fix, to keep each commit scoped to one reported issue.
+
+`add_to_playlist()` in `services/notification_service.py` adds a song via `playlist.songs.append(song)`. That relationship is configured with `secondary=playlist_entries`, so the append emits an insert containing only `playlist_id`, `song_id`, and `added_at`. But `playlist_entries` also declares `position` and `added_by` as `nullable=False`, and neither has a default. Adding a song that is not already in the playlist therefore raises `IntegrityError: NOT NULL constraint failed: playlist_entries.position`.
+
+It goes unnoticed because nothing in the normal setup path exercises it: `seed_data.py` populates playlists with explicit `playlist_entries.insert().values(...)` calls that supply `position` and `added_by` directly, rather than going through the relationship. A fix would mean computing the next position and threading `added_by` through, which is a behavioural change to an endpoint no open issue covers — so I left it alone and noted it here instead.
+
+My own test worked around it by inserting the entry the way `seed_data.py` does, so `add_to_playlist()` takes its "song already present" branch and the notification path stays under test.
 
