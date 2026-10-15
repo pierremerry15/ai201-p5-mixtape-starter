@@ -139,3 +139,37 @@ I also removed the now-unused `RECENT_THRESHOLD` constant and the `timedelta` im
 
 `get_activity_feed()` is the other function in the module and shares the friend-resolution and ordering logic, so I checked it was unaffected: it never referenced `RECENT_THRESHOLD`, applying a `limit` instead of a recency filter, which its docstring already called out as the deliberate difference between the two functions. Removing the constant therefore could not change it, and I confirmed no other module imported `RECENT_THRESHOLD` before deleting it. I also verified the deduplication loop still behaves correctly against a smaller result set, including the case where filtering removes every event for a friend — that friend simply no longer appears, which is the intended outcome — and the case of a user with no friends at all, which still returns early with an empty list.
 
+---
+
+### **Issue #3 — The same song keeps showing up twice in search**
+
+**How I reproduced it**
+
+The report contains the key to this one: *some* songs duplicate and others do not, and the specific song named — *Crown Heights Anthem* — comes back three times. So the reproduction is not "search and count" in general, it is searching for songs that differ in one particular property. `seed_data.py` turns out to group its songs into exactly three buckets with a comment marking the third as the relevant one: three songs with no tags, five with one tag, and five with three tags each, *Crown Heights Anthem* among them.
+
+Searching for a no-tag song returns one row, a one-tag song returns one row, and a three-tag song returns three identical rows. The multiplier is the tag count: a song appears once per tag it carries, and a song with no tags still appears once. `tests/test_search.py` already encodes this as three separate cases across the three buckets, and on the unmodified checkout only the multi-tag case fails.
+
+**How I found the root cause**
+
+`GET /songs/search?q=...` → `routes/songs.py::search()` → `search_service.search_songs()`. The route only forwards `q` and wraps the result with a `count` derived from the list length, so it could not be inventing rows; the duplication had to come from the query itself.
+
+`search_songs()` builds a single statement: `select(Song)`, an `outerjoin` onto the `song_tags` association table, and an `ilike` OR-filter over `title` and `artist`. Once I had the tag-count correlation from the reproduction, the join was the obvious suspect, and the mechanism is standard SQL rather than anything specific to this app: joining a one-to-many produces one result row per match on the many side. A song with three `song_tags` rows therefore yields three rows, each carrying the same `Song`. `.scalars()` then extracts the `Song` from each row, producing the same object three times, and `.all()` returns the list with the repeats intact — `scalars()` unwraps rows, it does not deduplicate them.
+
+What settled it was checking whether the join was earning its place. The filter references only `Song.title` and `Song.artist` — nothing from `song_tags`. And the tag names in the response do not come from the join either: they come from `Song.to_dict()`, which reads `self.tags`, a relationship declared in `models.py` with `lazy="subquery"` and therefore loaded by its own separate query whenever the attribute is touched. So the join contributed nothing to either the filtering or the output. Its only effect on the result was the duplication.
+
+**The root cause**
+
+The query outer-joined `song_tags` without restricting the result to distinct songs. Because the relationship between a song and its tags is one-to-many, the join multiplied each matching song into one row per tag, and the pipeline preserved those duplicates all the way to the response.
+
+The reason the symptom looked inconsistent to the reporter is that the multiplier is per-song: the row count equals the song's tag count, with the outer join guaranteeing a floor of one so untagged songs still appear exactly once. Songs with one tag are indistinguishable from correct behaviour, which is why only certain songs looked broken while others seemed fine.
+
+**My fix**
+
+Removed the `outerjoin` from the statement, leaving `select(Song).filter(...)`. Each matching song now produces exactly one row.
+
+I chose this over adding `.distinct()` deliberately. `.distinct()` would also have produced the right list, but it treats the symptom: the database would still build the multiplied result set and then collapse it, and the join would remain in the code looking as though the query depended on it. Since the join contributes to neither the filter nor the returned tag data, deleting it addresses why the duplicate rows existed in the first place and leaves a query whose shape matches what it actually needs. I also removed the `song_tags` and `Tag` imports, which this change left unused, and noted the one-row-per-song guarantee in the docstring.
+
+**My side-effect check**
+
+The thing worth verifying after deleting a join is that the data it appeared to supply is still present, so I checked that search results still include tag names. They do — `tags` is populated by `Song.to_dict()` through the `lazy="subquery"` relationship, on a path that never involved this query. A song with three tags still reports all three in its `tags` list; it simply does so once instead of three times. I confirmed the untagged and single-tag cases are unchanged, since those are the ones that looked correct before and could regress silently, and that a query matching nothing still returns an empty list rather than erroring. I also checked `get_song()`, the other function in the module, which does a primary-key lookup and never referenced the imports I removed.
+
