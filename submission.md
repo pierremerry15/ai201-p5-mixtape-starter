@@ -209,3 +209,41 @@ The risk in adding a side effect to an existing function is firing it when it sh
 
 I paid particular attention to re-rating, since the `unique_user_song_rating` constraint makes it a distinct path. Changing an existing rating updates the row in place and now also emits a notification — which I believe is right, since the sharer should learn their song was re-rated, and it matches the reporter's expectation that a rating produces a notification "same as for the playlist add." It does mean repeated re-rating produces repeated notifications; `add_to_playlist()` has the same property via its `if song not in playlist.songs` guard, so the two remain consistent with each other. Finally I confirmed `add_to_playlist()` itself is untouched and still produces its notification, and that `get_notifications()` returns both types together ordered by recency, since it filters only on `user_id` and optionally `read`.
 
+---
+
+### **Issue #5 — The last song in a playlist never shows up**
+
+**How I reproduced it**
+
+darius described a self-correcting symptom, which is the most informative part of the report: the missing song reappears when someone adds a new one, and the new one goes missing instead. So the reproduction has to be a sequence, not a single read.
+
+Fetch a playlist's songs via `GET /playlists/<id>/songs` and compare the returned `count` against the number of `playlist_entries` rows for that playlist — the response is short by exactly one, and the absent song is the one with the highest `position`. Then add another song and re-fetch: the previously missing song is now present, and the newly added one is absent. The deficit stays at exactly one no matter how many songs are added, and it is always the last by position. `tests/test_playlists.py::test_playlist_returns_all_songs` captures the static half of this, seeding five songs and asserting five come back; on the unmodified checkout it reports four.
+
+An empty playlist was worth checking separately during reproduction, because "always one short" and "returns nothing" are indistinguishable when the correct answer is zero.
+
+**How I found the root cause**
+
+`GET /playlists/<playlist_id>/songs` → `routes/playlists.py::get_songs()` → `playlist_service.get_playlist_songs()`. The route is a thin wrapper that builds `{"songs": songs, "count": len(songs)}` from whatever the service hands back, and since `count` is derived from the list rather than counted independently, the route reports the deficit faithfully rather than causing it.
+
+My first assumption was that the ordering was wrong, since "the last one" is a positional description. Reading the query ruled that out: it joins `Song` against `playlist_entries`, filters on `playlist_id`, and orders by `playlist_entries.c.position` ascending, which is correct — `position` is a not-null column on the association table, so playlist order is explicit rather than incidental, and the fetched rows were complete.
+
+That left the return statement, which is where the row disappears: `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice drops the final element of an already-correct, already-ordered list. Seeing it directly under a docstring that promises the opposite is what made it certain rather than suspicious.
+
+**The root cause**
+
+`get_playlist_songs()` sliced its result with `[:-1]` before serializing, discarding the last element of the ordered list. Because the query sorts by `position` ascending, the last element is the highest-positioned entry — the most recently added song — which is exactly the song users reported missing.
+
+This also explains the behaviour that made the bug look stranger than it is. The slice is relative to the current result, not tied to any particular song, so adding a new entry gives it the highest position, making it the new last element and therefore the new casualty. The previously hidden song moves up one place and becomes visible. The playlist is not hiding a specific song; it is always hiding whichever song is currently last.
+
+The function's own docstring states the contract it breaks twice over: "Songs are returned in the order they were added," and, under a `Note:`, "This function returns all songs in the playlist." The ordering half was honoured and the completeness half was not.
+
+**My fix**
+
+Removed the slice so the return reads `return [song.to_dict() for song in songs]`. Nothing else changed — the query, the filter, and the `order_by` were all already correct, and the only defect was the truncation applied to their result.
+
+**My side-effect check**
+
+Because the route derives `count` from the returned list, the fix corrects the reported count automatically, and I confirmed it now matches the number of `playlist_entries` rows for the playlist. I checked ordering is preserved, since my change touches the same expression that produces the final list: songs still come back ascending by `position`, which `test_playlist_returns_songs_in_order` asserts by exact title sequence.
+
+The boundary case I was most concerned about was the empty playlist, since `[][:-1]` is `[]` and a slice bug is invisible there — a playlist with no songs still returns an empty list rather than erroring, so removing the slice did not change behaviour in the one case where the old code was accidentally right. I also checked the single-song playlist, which is where the old code was most destructive (it returned nothing at all) and which now correctly returns that one song. The other functions in the module, `get_playlist()` and `get_user_playlists()`, do not go through this code path and are unaffected; `add_to_playlist()` in `notification_service.py` imports `get_playlist_songs` but does not call it, so nothing downstream depended on the truncated list.
+
