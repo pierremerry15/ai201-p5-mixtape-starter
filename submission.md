@@ -247,3 +247,19 @@ Because the route derives `count` from the returned list, the fix corrects the r
 
 The boundary case I was most concerned about was the empty playlist, since `[][:-1]` is `[]` and a slice bug is invisible there — a playlist with no songs still returns an empty list rather than erroring, so removing the slice did not change behaviour in the one case where the old code was accidentally right. I also checked the single-song playlist, which is where the old code was most destructive (it returned nothing at all) and which now correctly returns that one song. The other functions in the module, `get_playlist()` and `get_user_playlists()`, do not go through this code path and are unaffected; `add_to_playlist()` in `notification_service.py` imports `get_playlist_songs` but does not call it, so nothing downstream depended on the truncated list.
 
+---
+
+## Regression Tests
+
+Three of the five issues already had failing tests in the repo — `test_streak_increments_on_sunday`, `test_search_no_duplicates_multi_tag_song`, and `test_playlist_returns_all_songs` each fail before the corresponding fix and pass after it. Issues #2 and #4 had no coverage at all, so I added two modules for them.
+
+**`tests/test_feed.py`** — covers Issue #2. The test that would have caught the bug is `test_listen_from_late_yesterday_is_excluded`: it records a listen one minute before midnight and asserts the feed is empty. Under the old rolling 24-hour cutoff that event is still within the window for all but the final minute of the day, so the test fails; under the calendar-day cutoff it is excluded. The test asserts the elapsed time is under 24 hours before checking, so it fails loudly rather than passing vacuously if it is ever run in that last minute. `test_listen_from_today_appears` holds the other side of the boundary so the fix cannot be trivially satisfied by filtering everything out, and the module also covers per-friend deduplication and the no-friends case.
+
+**`tests/test_notifications.py`** — covers Issue #4. `test_rating_a_song_notifies_the_sharer` is the direct regression test: it fails against the original `rate_song()`, which created no notification. `test_rating_and_playlist_add_both_notify` asserts the two parallel actions produce both notification types for the same sharer, which is the consistency the issue was really about. The remaining cases pin the guards I reasoned about in the side-effect check — that rating your own song notifies nobody, that a rejected out-of-range score leaves no notification behind, and that a one-star rating is not rendered "1 stars."
+
+Run the full suite with:
+
+```bash
+pytest tests/
+```
+
