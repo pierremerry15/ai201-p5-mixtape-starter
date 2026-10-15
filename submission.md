@@ -79,4 +79,29 @@ Any `ValueError` raised anywhere in steps 3–4 unwinds to the route's `except` 
 
 ## Root Cause Analyses
 
-_Entries follow below, one per bug fixed._
+### **Issue #1 — My listening streak keeps resetting**
+
+**How I reproduced it**
+
+The report had an unusually specific clue — it happened twice, and both times on a Sunday — so the reproduction needed to control the calendar day rather than just the gap between listens. The repo already ships a test that does exactly this, `tests/test_streaks.py::test_streak_increments_on_sunday`, which calls `update_listening_streak()` with a fixed Saturday (`2024-06-15`) and then a fixed Sunday (`2024-06-16`) and asserts the streak reaches 2. Running `pytest tests/test_streaks.py` on the unmodified checkout fails that case with the streak at 1 while the four neighbouring cases (new user, consecutive weekday, same-day double listen, skipped day) all pass. That pattern — consecutive days increments fine on a Tuesday, resets on a Sunday — is kenji's report reproduced deterministically, without waiting for an actual Sunday.
+
+**How I found the root cause**
+
+I traced from the endpoint named in the report. `GET /users/<id>/streak` lands in `routes/users.py::streak()`, which calls `streak_service.get_streak()` — but that function only reads `user.listening_streak` back, so it could not be where the value was destroyed. That told me the corruption happened on the *write* path, not the read path, so I followed the other entry point into the same service: `POST /songs/<id>/listen` → `routes/songs.py::listen()` → `record_listening_event()` → `update_listening_streak()`.
+
+`update_listening_streak()` is short, and its docstring states the rules plainly: increment when the user listened yesterday, reset only when more than one day has passed. Reading the branch that implements those rules against the docstring directly above it was the moment it was obvious — the increment branch carries a second condition that the documented rules never mention.
+
+**The root cause**
+
+The increment branch read `elif days_since_last == 1 and today.weekday() != 6:`. `days_since_last == 1` is the correct and sufficient test for "listened yesterday." The extra `today.weekday() != 6` clause adds a requirement that today must not be Sunday, because Python's `datetime.weekday()` numbers Monday as 0 through Sunday as 6.
+
+The damage comes from what the condition falls through to. The branch is an `elif` in a three-way chain ending in a bare `else` that sets the streak to 1. So on a Sunday a user who listened yesterday fails the increment test and lands in the reset branch — the same branch that exists to handle genuinely skipped days. The code cannot distinguish "you listened yesterday but today is Sunday" from "you missed a day," and treats the first as the second. That is why kenji's streak went to 1 rather than simply failing to advance from 12, and why Monday's listen moved it to 2: by then `last_listened_at` was Sunday, `days_since_last` was 1, Monday is not day 6, so the increment branch ran normally against a counter that had already been reset.
+
+**My fix**
+
+Removed the `and today.weekday() != 6` clause so the branch reads `elif days_since_last == 1:`. One line, and it restores the condition to exactly what the function's own docstring specifies. No other logic needed to change — the same-day no-op branch and the reset branch were both already correct, and the day-of-week check was the only thing standing between them and the documented behaviour.
+
+**My side-effect check**
+
+The concern with touching a three-way branch is breaking the cases that were working, so I checked each of the other documented rules still holds. The remaining tests in `tests/test_streaks.py` cover them directly: a first-time listener still starts at 1 (that path returns early, before the branch I edited), listening twice in one day still leaves the streak unchanged (`days_since_last == 0` returns before reaching the `elif`), and skipping a day still resets to 1 (`days_since_last == 2` fails the `elif` and falls to the `else`, which is now the only way to reach it). I also specifically checked the Saturday→Sunday and Sunday→Monday transitions, since the fix changes behaviour on both sides of that boundary — the condition is now purely a function of the day gap, so neither direction can special-case itself any more.
+
