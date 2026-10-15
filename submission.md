@@ -173,3 +173,39 @@ I chose this over adding `.distinct()` deliberately. `.distinct()` would also ha
 
 The thing worth verifying after deleting a join is that the data it appeared to supply is still present, so I checked that search results still include tag names. They do — `tags` is populated by `Song.to_dict()` through the `lazy="subquery"` relationship, on a path that never involved this query. A song with three tags still reports all three in its `tags` list; it simply does so once instead of three times. I confirmed the untagged and single-tag cases are unchanged, since those are the ones that looked correct before and could regress silently, and that a query matching nothing still returns an empty list rather than erroring. I also checked `get_song()`, the other function in the module, which does a primary-key lookup and never referenced the imports I removed.
 
+---
+
+### **Issue #4 — I got notified when a friend added my song to a playlist but not when they rated it**
+
+**How I reproduced it**
+
+aaliya's report conveniently includes its own control case, so I reproduced both halves against the same pair of users. Have one user add another's shared song to a playlist, then read `GET /users/<sharer_id>/notifications`: a `song_added_to_playlist` entry is there. Then have the same user rate a different song shared by the same person via `POST /songs/<song_id>/rate`, and read the notifications again: the list is unchanged.
+
+The second observation is what makes this precise rather than a vague "notifications are flaky." The rating itself succeeds — the endpoint returns `201`, and fetching the song back shows the rating persisted. So the write path works and only the notification is absent. That rules out a failed request or a rolled-back transaction and points at something the rating path simply never does. It also matches the reporter's note that this affects everyone she asked, rather than being specific to her account or one song.
+
+**How I found the root cause**
+
+The hint that the cause is architectural rather than a typo shaped how I read this. Both actions live in the same file, `services/notification_service.py`, which is the natural place to compare them, so I read `add_to_playlist()` and `rate_song()` against each other line by line.
+
+They are near-identical in structure. Both load the target `Song` and the acting `User` with `db.session.get()` and raise `ValueError` if either is missing. Both mutate state — one appends to `playlist.songs`, the other updates or inserts a `Rating`. Both call `db.session.commit()`. Then they diverge: `add_to_playlist()` continues past the commit into a guarded notification block, checking `if song.shared_by != added_by_user_id:` and calling `create_notification()` with a type of `song_added_to_playlist`. `rate_song()` commits and returns.
+
+Two further things confirmed this was an omission rather than a deliberate design choice. First, `create_notification()`'s own docstring documents its `notification_type` parameter as "a short type string, e.g. `'song_added_to_playlist'` or `'song_rated'`" — the module already names the event type that nothing in the codebase ever creates. Second, `get_notifications()` applies no filtering by type, so a `song_rated` row would be returned to the user if one existed. The retrieval side was ready for a notification the creation side never produced.
+
+**The root cause**
+
+`rate_song()` never called `create_notification()`. The function performed its own job correctly — validating the score, honouring the one-rating-per-user-per-song constraint by updating in place when a row already existed, and committing — but the notification side effect that the sibling action performs was simply absent from it.
+
+So this is not a bug in the notification machinery. `create_notification()` works, which is why playlist-add notifications arrive reliably, and the storage and retrieval paths are type-agnostic. The failure is that one of the two user actions that should emit a notification was never wired to the mechanism, leaving an inconsistency between two operations that the module otherwise treats as parallel. That is also why no error ever surfaced: nothing failed, a step just never happened.
+
+**My fix**
+
+Added a notification block to `rate_song()` after the commit, mirroring the one in `add_to_playlist()`: the same `if song.shared_by != <actor_id>:` guard so people are not notified about their own ratings, a call to `create_notification()` targeting `song.shared_by`, and the `song_rated` type the module's documentation already specified. The body follows the phrasing of the existing message — `"{rater.username} rated your song '{song.title}' {score} stars."` — with the noun singularised for a score of 1 so a one-star rating does not read "1 stars."
+
+Placing the call after `db.session.commit()` is deliberate and matches the sibling: the rating is durable before any notification is emitted, so a failure in notification creation cannot leave a user notified about a rating that was not saved. I also updated the function's docstring, which previously described only the saving half of its job.
+
+**My side-effect check**
+
+The risk in adding a side effect to an existing function is firing it when it should not fire, so I checked the paths where it must stay silent. A user rating their own shared song produces no notification, because the `song.shared_by != user_id` guard short-circuits exactly as it does for playlist adds. Invalid input is unaffected: an out-of-range score and a missing song or user all raise `ValueError` before the commit, so no notification is created for a rating that never happened, and the route still converts those into a `400`.
+
+I paid particular attention to re-rating, since the `unique_user_song_rating` constraint makes it a distinct path. Changing an existing rating updates the row in place and now also emits a notification — which I believe is right, since the sharer should learn their song was re-rated, and it matches the reporter's expectation that a rating produces a notification "same as for the playlist add." It does mean repeated re-rating produces repeated notifications; `add_to_playlist()` has the same property via its `if song not in playlist.songs` guard, so the two remain consistent with each other. Finally I confirmed `add_to_playlist()` itself is untouched and still produces its notification, and that `get_notifications()` returns both types together ordered by recency, since it filters only on `user_id` and optionally `read`.
+
