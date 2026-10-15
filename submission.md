@@ -105,3 +105,37 @@ Removed the `and today.weekday() != 6` clause so the branch reads `elif days_sin
 
 The concern with touching a three-way branch is breaking the cases that were working, so I checked each of the other documented rules still holds. The remaining tests in `tests/test_streaks.py` cover them directly: a first-time listener still starts at 1 (that path returns early, before the branch I edited), listening twice in one day still leaves the streak unchanged (`days_since_last == 0` returns before reaching the `elif`), and skipping a day still resets to 1 (`days_since_last == 2` fails the `elif` and falls to the `else`, which is now the only way to reach it). I also specifically checked the Saturday→Sunday and Sunday→Monday transitions, since the fix changes behaviour on both sides of that boundary — the condition is now purely a function of the day gap, so neither direction can special-case itself any more.
 
+---
+
+### **Issue #2 — Friends Listening Now shows people from yesterday**
+
+**How I reproduced it**
+
+The detail that makes this reproducible is in the timings rather than the data: nova checked at 9am and saw a listen from 11pm the night before — a gap of about ten hours. Any fixed-duration window longer than ten hours will show that event, so the reproduction is to create a `ListeningEvent` for a friend timestamped late on the previous calendar day and then call `get_friends_listening_now()` as if it were the following morning. The event comes back in the feed even though it did not happen today. The complementary half of the reproduction is what makes the shape unmistakable: take that same event and query it at, say, 11:30pm the following night instead, and it has disappeared — not because the calendar rolled over, but because 24 hours elapsed. The entry's lifetime tracks the clock, not the day. I added `tests/test_feed.py` to pin both halves down (see the regression test section).
+
+**How I found the root cause**
+
+`GET /feed/<user_id>/listening-now` → `routes/feed.py::listening_now()` → `feed_service.get_friends_listening_now()`. The service does three things — resolve friend IDs, filter events by a cutoff, deduplicate to one event per friend — and only the second could produce "too old" entries, so that is where I looked.
+
+What made me confident was comparing the filter against the feature it serves rather than against some notion of correct time handling. The cutoff was computed as `datetime.now(timezone.utc) - RECENT_THRESHOLD`, with `RECENT_THRESHOLD = timedelta(hours=24)` defined at module scope. That is a correct implementation of "in the last 24 hours." The feature, per its name and per the reported expectation, is "today." Those two are different specifications that happen to agree for most of the day and diverge exactly at the boundary the user noticed.
+
+I briefly suspected timezone handling instead, since mixing naive and aware datetimes is a common source of this symptom. Reading the module ruled that out: `datetime.now(timezone.utc)` is UTC-aware and the stored `listened_at` values are written UTC-aware too, so the comparison is consistent. The mismatch is semantic, not arithmetic.
+
+**The root cause**
+
+`get_friends_listening_now()` filtered on a rolling window anchored to the moment of the request — `now - 24 hours` — rather than on a calendar-day boundary. A rolling window has no notion of "yesterday"; it only knows elapsed time. So an event at 11pm stays inside the window until 11pm the next day, which is precisely the behaviour nova described: "stuff from yesterday evening keeps hanging around in the feed until the same time the next day." Every entry in the feed got a 24-hour lifetime starting from when it happened, and because each event carries its own timestamp, each one expired at a different moment rather than all of them clearing together at midnight.
+
+The deduplication step downstream then made the stale data more prominent rather than less. It keeps the single most recent event per friend, so for a friend whose only activity was last night, the stale event is not merely present in a long list — it is that friend's entire representation in the feed, labelled as what they are listening to now.
+
+**My fix**
+
+Replaced the rolling cutoff with the start of the current UTC day: `cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)`. The filter and ordering around it are untouched, so the query shape is the same — only the anchor moved from "24 hours before this request" to "midnight at the start of today."
+
+This fixes the root cause rather than the symptom because the failure was never that the window was the wrong *length*; shortening `RECENT_THRESHOLD` to, say, 12 hours would still have left entries expiring on a rolling schedule and would have introduced a new wrong answer (a friend who listened at 8am would vanish by 8pm the same day, while still being someone who listened today). Anchoring to midnight makes the window mean the same thing the feature name means, and makes the whole feed turn over at once at the day boundary.
+
+I also removed the now-unused `RECENT_THRESHOLD` constant and the `timedelta` import it needed, so the module does not carry a dead constant that still looks like the feed's configuration, and I updated the function's docstring to state the calendar-day semantics explicitly so the next reader has the contract written down.
+
+**My side-effect check**
+
+`get_activity_feed()` is the other function in the module and shares the friend-resolution and ordering logic, so I checked it was unaffected: it never referenced `RECENT_THRESHOLD`, applying a `limit` instead of a recency filter, which its docstring already called out as the deliberate difference between the two functions. Removing the constant therefore could not change it, and I confirmed no other module imported `RECENT_THRESHOLD` before deleting it. I also verified the deduplication loop still behaves correctly against a smaller result set, including the case where filtering removes every event for a friend — that friend simply no longer appears, which is the intended outcome — and the case of a user with no friends at all, which still returns early with an empty list.
+
