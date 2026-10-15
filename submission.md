@@ -28,6 +28,8 @@ Where I had to correct it or do the work myself:
 
 Written before opening any issue. This describes how the app is put together.
 
+It is a snapshot of the code as I found it, left as written. Two details it records were later changed by fixes — `feed_service.py`'s `RECENT_THRESHOLD` constant, and the join in `search_service.py` — and `tests/` has since grown from three modules to five. Each of those changes is covered in the root cause analyses below.
+
 ### Top level
 
 - **`app.py`** — Flask application factory. Creates the `SQLAlchemy` object (`db`) that every other module imports, reads `DATABASE_URL` from the environment (defaulting to `sqlite:///mixtape.db`), registers the four blueprints under their URL prefixes (`/songs`, `/playlists`, `/users`, `/feed`), and calls `db.create_all()` inside an app context. `db` lives here rather than in `models.py`, which is why `models.py` starts with `from app import db` — the import direction is app → models, not the reverse.
@@ -38,7 +40,7 @@ Written before opening any issue. This describes how the app is put together.
   - `User.listening_streak` and `User.last_listened_at` are denormalized onto the user row — the streak is a stored counter that gets mutated on each listen, not something recomputed from `ListeningEvent` history.
   - `Rating` has a `UniqueConstraint` on `(user_id, song_id)`, so a user has at most one rating per song; re-rating must be an update, not an insert.
   - Most models expose `to_dict()`, which is what the routes serialize.
-- **`seed_data.py`** — Drops and recreates all tables, then populates 5 users with friendships, 25 songs deliberately spread across 0-tag / 1-tag / 3-tag groups, 3 playlists, listening events at a mix of ages, and one pre-existing notification.
+- **`seed_data.py`** — Drops and recreates all tables, then populates 5 users with friendships, 13 songs deliberately spread across tag-count groups (3 with no tags, 5 with one, 5 with three), 3 playlists, listening events at a mix of ages, and one pre-existing notification. Its module docstring says 25 songs, but the three literal lists below it define 13, which is also what the script reports when it runs — worth knowing if you are counting rows against the docstring.
 - **`tests/`** — Three pytest modules (`test_streaks.py`, `test_search.py`, `test_playlists.py`). Each defines its own `app` fixture building an in-memory SQLite database via `create_app({"TESTING": True, "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:"})`, so tests touch the service functions directly rather than going over HTTP. There is no shared `conftest.py`; the fixture is duplicated per module.
 
 ### The layering pattern
