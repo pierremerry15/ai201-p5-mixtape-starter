@@ -7,7 +7,7 @@ Handles song search logic.
 from sqlalchemy import select
 
 from app import db
-from models import Song, Tag, song_tags
+from models import Song
 
 
 def search_songs(query: str) -> list[dict]:
@@ -15,7 +15,8 @@ def search_songs(query: str) -> list[dict]:
     Search for songs by title or artist name.
 
     Returns all songs where the title or artist contains the query string
-    (case-insensitive), along with their associated tags.
+    (case-insensitive), along with their associated tags. Each matching song
+    appears exactly once regardless of how many tags it carries.
 
     Args:
         query: The search string to match against title and artist fields.
@@ -26,9 +27,7 @@ def search_songs(query: str) -> list[dict]:
     """
     results = (
         db.session.execute(
-            select(Song)
-            .outerjoin(song_tags, Song.id == song_tags.c.song_id)
-            .filter(
+            select(Song).filter(
                 db.or_(
                     Song.title.ilike(f"%{query}%"),
                     Song.artist.ilike(f"%{query}%"),
